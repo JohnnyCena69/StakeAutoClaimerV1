@@ -1,0 +1,898 @@
+// ==UserScript==
+// @name         Stake Monitor + Auto Claimer PRO V10  TEST
+// @namespace    stakepanel
+// @version      2.0
+// @description  Monitor + Auto-claim with real-time console
+// @match        https://stake.com/*settings/offers*
+// @grant        unsafeWindow
+// @grant        GM_getValue
+// @grant        GM_setValue
+// @run-at       document-idle
+// @noframes
+// ==/UserScript==
+
+(function () {
+  'use strict';
+
+  /* ============================================================
+     CONFIGURATION
+  ============================================================ */
+  const TELEGRAM_TOKEN   = '8643945447:AAFmAC8lqDvZi0RzScrfP-VmDDSIqKeoxZw';
+  const TELEGRAM_CHAT_ID = '7042816446';
+  const SITE_KEY         = '0x4AAAAAAAGD4gMGOTFnvupz';
+  const GRAPHQL_URL      = 'https://stake.com/_api/graphql';
+
+  /* ============================================================
+     MONITOR STATE
+  ============================================================ */
+  let notifEnabled  = JSON.parse(localStorage.getItem('notifEnabled') ?? 'true');
+  let lastPushTime  = 0;
+  let saved         = JSON.parse(localStorage.getItem('stakeStats') || '{}');
+  let lifetimeUsd   = saved.lifetimeUsd  || 0;
+  let dailyUsd      = saved.dailyUsd     || 0;
+  let weeklyUsd     = saved.weeklyUsd    || 0;
+  let savedDay      = saved.savedDay     || new Date().getDate();
+  let savedWeek     = saved.savedWeek    || Date.now();
+  let graphData     = saved.graphData    || [];
+  let graphTimeData = saved.graphTimeData|| [];
+  let totalClaims   = 0;
+  let successClaims = 0;
+  let failedClaims  = 0;
+  let sessionUsd    = 0;
+  let heartbeat     = true;
+  let startTime     = Date.now();
+
+  /* ============================================================
+     CLAIMER STATE
+  ============================================================ */
+  let authToken     = null;
+  let claimCurrency = localStorage.getItem('claimer_currency') || 'usdt';
+  let isClaiming    = false;
+  const claimedSet  = new Set();
+
+  /* ============================================================
+     CONSOLE LOG BUFFER
+  ============================================================ */
+  const LOG_MAX = 80;
+  let consoleLogs = [];
+
+  const LOG_COLORS = {
+    info   : '#b1bad3',
+    success: '#00ff88',
+    error  : '#ff4d4d',
+    warn   : '#ffaa00',
+    system : '#00ccff',
+  };
+
+  function log(msg, type = 'info') {
+    const time  = new Date().toLocaleTimeString('en-US', { hour12: false });
+    consoleLogs.push({ time, msg, type });
+    if (consoleLogs.length > LOG_MAX) consoleLogs.shift();
+    console.log('[StakeClaimer] ' + time + ' ' + msg);
+    flushConsole();
+  }
+
+  function flushConsole() {
+    const el = document.getElementById('scp-console');
+    if (!el) return;
+    el.innerHTML = consoleLogs.map(e =>
+      `<div style="color:${LOG_COLORS[e.type]||LOG_COLORS.info};margin-bottom:1px;">` +
+      `<span style="color:#3a5a6a;user-select:none;">[${e.time}]</span> ${e.msg}` +
+      `</div>`
+    ).join('');
+    el.scrollTop = el.scrollHeight;
+  }
+
+  function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+  /* ============================================================
+     1. TELEGRAM
+  ============================================================ */
+  function sendPush(title, body) {
+    if (!notifEnabled) return;
+    const now = Date.now();
+    if (now - lastPushTime < 5000) return;
+    lastPushTime = now;
+    _origFetch('https://api.telegram.org/bot' + TELEGRAM_TOKEN + '/sendMessage', {
+      method  : 'POST',
+      headers : { 'Content-Type': 'application/json' },
+      body    : JSON.stringify({ chat_id: TELEGRAM_CHAT_ID, text: title + '\n' + body }),
+    }).catch(() => {});
+  }
+
+  /* ============================================================
+     2. SAVE / RESET
+  ============================================================ */
+  function saveStats() {
+    localStorage.setItem('stakeStats', JSON.stringify({
+      lifetimeUsd, dailyUsd, weeklyUsd,
+      savedDay, savedWeek, graphData, graphTimeData,
+    }));
+  }
+
+  function checkReset() {
+    const today = new Date().getDate();
+    if (today !== savedDay)                 { dailyUsd = 0; savedDay = today; }
+    if (Date.now() - savedWeek > 604800000) { weeklyUsd = 0; savedWeek = Date.now(); }
+  }
+
+/* ============================================================
+     3. AUTH TOKEN INTERCEPTOR
+  ============================================================ */
+
+  // Récupère le token depuis le cookie "session"
+  function getSessionToken() {
+    const cookies = document.cookie.split(';');
+    for (const c of cookies) {
+      const parts = c.trim().split('=');
+      const key   = parts[0];
+      const val   = parts.slice(1).join('=');
+      if (key === 'session' && val) return val;
+    }
+    return null;
+  }
+
+  // Capture immédiate au démarrage
+  authToken = getSessionToken();
+  if (authToken) {
+    log('🔑 Auth token captured from cookie', 'system');
+  }
+
+  // Refresh toutes les 60s au cas où le cookie change
+  setInterval(() => {
+    const fresh = getSessionToken();
+    if (fresh && fresh !== authToken) {
+      authToken = fresh;
+      log('🔑 Auth token refreshed', 'system');
+      updatePanel();
+    }
+  }, 60000);
+
+  // Garde aussi le hook fetch comme fallback
+  const _origFetch = window.fetch;
+  window.fetch = async function (input, init = {}) {
+    const url     = typeof input === 'string' ? input : (input?.url ?? '');
+    const headers = init?.headers ?? {};
+    if (url.includes('_api/graphql') || url.includes('graphql')) {
+      const tok =
+        headers['x-access-token'] ||
+        headers['X-Access-Token'] ||
+        headers['authorization']  ||
+        headers['Authorization'];
+      if (tok && tok !== authToken) {
+        authToken = tok.replace(/^Bearer\s+/i, '');
+        log('🔑 Auth token captured via fetch', 'system');
+        updatePanel();
+      }
+    }
+    return _origFetch.apply(this, arguments);
+  };
+
+  /* ============================================================
+     4. WEBSOCKET HOOK
+  ============================================================ */
+  const _origWS = window.WebSocket;
+  window.WebSocket = function (url, protocols) {
+    const ws = protocols ? new _origWS(url, protocols) : new _origWS(url);
+    if (!url.includes('stake.com')) return ws;
+    log('🔌 WebSocket connected to Stake', 'system');
+    ws.addEventListener('message', (evt) => {
+      try { handleWSMessage(JSON.parse(evt.data)); } catch (_) {}
+    });
+    return ws;
+  };
+  Object.assign(window.WebSocket, _origWS);
+
+  function handleWSMessage(msg) {
+    if (msg?.type !== 'next') return;
+    const data = msg?.payload?.data;
+    if (!data) return;
+    for (const key of ['drops', 'bonusDrop', 'promotionDrop', 'rainDrop']) {
+      if (data[key]) {
+        log('📡 WebSocket drop event [' + key + ']', 'system');
+        onDropReceived(data[key]);
+      }
+    }
+  }
+
+  function onDropReceived(dropData) {
+    const code =
+      dropData?.code       ||
+      dropData?.bonusCode  ||
+      dropData?.promoCode  ||
+      dropData?.data?.code ||
+      null;
+    if (!code) { log('⚠️ Drop received but no code found', 'warn'); return; }
+    const upper = code.toUpperCase();
+    if (claimedSet.has(upper)) { log('🚫 Already processed: ' + upper, 'warn'); return; }
+    log('🎁 New drop detected: ' + upper, 'system');
+    processClaim(upper);
+  }
+
+  /* ============================================================
+     5. TURNSTILE MANAGER
+  ============================================================ */
+  class TurnstileManager {
+    constructor() {
+      this.widgetId     = null;
+      this.cache        = [];
+      this.maxCache     = 2;
+      this.ttl          = 4 * 60 * 1000;
+      this.isGenerating = false;
+      this.ready        = false;
+      this._maintainer  = null;
+    }
+
+    async init() {
+      if (this.ready) return;
+      try {
+        await this._loadScript();
+        this.ready = true;
+        log('✅ Turnstile ready', 'system');
+        setTimeout(() => this._refill(), 4000);
+        this._startMaintainer();
+      } catch (e) {
+        log('❌ Turnstile failed to load: ' + e.message, 'error');
+      }
+    }
+
+    _loadScript() {
+      return new Promise((res, rej) => {
+        if (unsafeWindow.turnstile) { res(); return; }
+        const s   = document.createElement('script');
+        s.src     = 'https://challenges.cloudflare.com/turnstile/v0/api.js';
+        s.async   = true;
+        s.onload  = res;
+        s.onerror = rej;
+        document.head.appendChild(s);
+      });
+    }
+
+    _createToken() {
+      return new Promise((res, rej) => {
+        const container = document.getElementById('_turnstile_container');
+        if (!container) { rej(new Error('Turnstile container not found')); return; }
+        this.isGenerating = true;
+        this.widgetId = unsafeWindow.turnstile.render(container, {
+          sitekey           : SITE_KEY,
+          theme             : 'dark',
+          callback          : (t) => { this.isGenerating = false; res(t); },
+          'error-callback'  : (e) => { this.isGenerating = false; rej(new Error(String(e))); },
+          'timeout-callback': ()  => { this.isGenerating = false; rej(new Error('Turnstile timeout')); },
+        });
+      });
+    }
+
+    _removeWidget() {
+      if (this.widgetId !== null) {
+        try { unsafeWindow.turnstile.remove(this.widgetId); } catch (_) {}
+        this.widgetId = null;
+      }
+    }
+
+    _pruneExpired() {
+      const now = Date.now();
+      this.cache = this.cache.filter(t => now - t.ts < this.ttl);
+    }
+
+    async _refill() {
+      if (this.isGenerating) return;
+      this._pruneExpired();
+      const needed = this.maxCache - this.cache.length;
+      for (let i = 0; i < needed; i++) {
+        try {
+          const token = await this._createToken();
+          this.cache.push({ token, ts: Date.now() });
+          this._removeWidget();
+          if (i < needed - 1) await sleep(2000);
+        } catch (e) {
+          this._removeWidget();
+          log('⚠️ Turnstile refill error: ' + e.message + ' — retrying in 15s', 'warn');
+          await sleep(15000);
+          break;
+        }
+      }
+    }
+
+    _startMaintainer() {
+      this._maintainer = setInterval(() => {
+        this._pruneExpired();
+        if (this.cache.length < this.maxCache) this._refill();
+      }, 30000);
+    }
+
+    async getToken() {
+      this._pruneExpired();
+      if (this.cache.length > 0) {
+        const { token } = this.cache.shift();
+        log('🪙 Using cached Turnstile token', 'system');
+        setTimeout(() => this._refill(), 500);
+        return token;
+      }
+      log('⏳ No cached token, generating now...', 'warn');
+      const token = await this._createToken();
+      this._removeWidget();
+      return token;
+    }
+  }
+
+  const turnstileManager = new TurnstileManager();
+
+  /* ============================================================
+     6. GRAPHQL
+  ============================================================ */
+  function gqlRequest(body) {
+    if (!authToken) throw new Error('Auth token not available');
+    return _origFetch(GRAPHQL_URL, {
+      method  : 'POST',
+      headers : {
+        'Content-Type'     : 'application/json',
+        'x-access-token'   : authToken,
+        'x-operation-name' : body.operationName || '',
+        'x-operation-type' : 'query',
+      },
+      body: JSON.stringify(body),
+    });
+  }
+
+  async function checkCode(code) {
+    const res = await gqlRequest({
+      operationName: 'BonusCodeInformation',
+      query: `query BonusCodeInformation($code: String!, $couponType: CouponType!) {
+  bonusCodeInformation(code: $code, couponType: $couponType) {
+    availabilityStatus
+    bonusValue
+  }
+}`,
+      variables: { code, couponType: 'drop' },
+    });
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    const json = await res.json();
+    if (json.errors?.length) {
+      const e = json.errors[0];
+      throw Object.assign(new Error(e.message), { errorType: e.errorType });
+    }
+    return json.data?.bonusCodeInformation?.availabilityStatus ?? null;
+  }
+
+  async function claimCode(code, currency, turnstileToken) {
+    const res = await gqlRequest({
+      operationName: 'ClaimConditionBonusCode',
+      query: `mutation ClaimConditionBonusCode($code: String!, $currency: CurrencyEnum!, $turnstileToken: String!) {
+  claimConditionBonusCode(code: $code currency: $currency turnstileToken: $turnstileToken) {
+    bonusCode { id code __typename }
+    amount
+    currency
+    user {
+      id
+      balances { available { amount currency __typename } __typename }
+      __typename
+    }
+    __typename
+  }
+}`,
+      variables: { code, currency, turnstileToken },
+    });
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    const json = await res.json();
+    if (json.errors?.length) {
+      const e = json.errors[0];
+      throw Object.assign(new Error(e.message), { errorType: e.errorType });
+    }
+    const result = json.data?.claimConditionBonusCode;
+    if (!result) throw new Error('Empty response');
+    return result;
+  }
+
+  /* ============================================================
+     7. CLAIM LOGIC
+  ============================================================ */
+  async function processClaim(code) {
+    if (isClaiming) {
+      log('⏸ Another claim in progress, queuing ' + code + ' in 3s...', 'warn');
+      setTimeout(() => processClaim(code), 3000);
+      return;
+    }
+    isClaiming = true;
+    claimedSet.add(code);
+
+    try {
+      if (!authToken) {
+        log('⏳ Waiting for auth token...', 'warn');
+        await waitForToken();
+      }
+
+      // Step 1: Scan code
+      log('🔍 Scanning code: ' + code + '...', 'info');
+      let status;
+      try {
+        status = await checkCode(code);
+        log('📋 Code status: ' + (status || 'null'), status === 'available' ? 'success' : 'warn');
+      } catch (e) {
+        log('❌ Code check failed: ' + (e.errorType || e.message), 'error');
+        handleClaim(code, 0, false, e.errorType || 'checkError', claimCurrency);
+        return;
+      }
+
+      if (!['available', 'codeClaimSet'].includes(status)) {
+        log('🚫 Code not claimable — ' + status, 'error');
+        handleClaim(code, 0, false, status, claimCurrency);
+        return;
+      }
+
+      // Step 2: Turnstile
+      log('🛡️ Requesting Turnstile verification...', 'info');
+      let tsToken;
+      try {
+        tsToken = await turnstileManager.getToken();
+        log('✅ Turnstile verified successfully', 'success');
+      } catch (e) {
+        log('❌ Turnstile error: ' + e.message, 'error');
+        handleClaim(code, 0, false, 'turnstileError', claimCurrency);
+        return;
+      }
+
+      // Step 3: Claim
+      log('🚀 Claiming ' + code + ' → ' + claimCurrency.toUpperCase() + '...', 'info');
+      let result;
+      try {
+        result = await claimCode(code, claimCurrency, tsToken);
+      } catch (e) {
+        log('❌ Claim failed: ' + (e.errorType || e.message), 'error');
+        handleClaim(code, 0, false, e.errorType || 'claimError', claimCurrency);
+        return;
+      }
+
+      const amount   = parseFloat(result.amount ?? 0);
+      const currency = result.currency ?? claimCurrency;
+      log('🎉 SUCCESS! +' + amount.toFixed(8) + ' ' + currency.toUpperCase() + ' claimed!', 'success');
+      handleClaim(code, amount, true, '', currency);
+
+    } finally {
+      isClaiming = false;
+      updatePanel();
+    }
+  }
+
+  function waitForToken(maxWait = 15000) {
+    return new Promise((res, rej) => {
+      if (authToken) { res(); return; }
+      const iv = setInterval(() => { if (authToken) { clearInterval(iv); res(); } }, 500);
+      setTimeout(() => { clearInterval(iv); rej(new Error('Auth token not found after timeout')); }, maxWait);
+    });
+  }
+
+  /* ============================================================
+     8. HANDLE CLAIM
+  ============================================================ */
+  function handleClaim(code, amount, success, reason = '', currency = '') {
+    totalClaims++;
+    checkReset();
+
+    const reasonMap = {
+      bonusCodeInactive      : 'Fully claimed',
+      codeAlreadyClaimed     : 'Already claimed',
+      alreadyClaimed         : 'Already claimed',
+      weeklyWagerRequirement : 'Not enough wager',
+      kycLevelNotSufficient  : 'KYC required',
+      emailUnverified        : 'Email not verified',
+      dropUnavailable        : 'Drop unavailable',
+    };
+    const reasonText = reasonMap[reason] || reason || 'Unknown';
+    const time = new Date().toLocaleTimeString();
+
+    if (success) {
+      successClaims++;
+      if (amount > 0) {
+        sessionUsd  += amount;
+        dailyUsd    += amount;
+        weeklyUsd   += amount;
+        lifetimeUsd += amount;
+        graphData.push(lifetimeUsd);
+        graphTimeData.push(new Date().toLocaleTimeString().slice(0, 5));
+        if (graphTimeData.length > 30) graphTimeData.shift();
+        sendPush(
+          '✅ Claim Successful!',
+          '🎁 Code: '      + code +
+          '\n💰 Value: $'   + amount.toFixed(2) +
+          '\n💎 Currency: ' + currency.toUpperCase() +
+          '\n🕐 '           + time
+        );
+      }
+    } else {
+      failedClaims++;
+      sendPush(
+        '❌ Claim Failed',
+        '🎁 Code: '     + code +
+        '\n📋 Reason: ' + reasonText +
+        '\n🕐 '         + time
+      );
+    }
+
+    if (graphData.length > 30) graphData.shift();
+    saveStats();
+    updatePanel();
+  }
+
+  /* ============================================================
+     9. STYLES
+  ============================================================ */
+  const style = document.createElement('style');
+  style.innerHTML = `
+    .scp-btn {
+      display:flex; align-items:center; gap:4px;
+      background:#0f212e; border:2px solid;
+      padding:5px 8px; font-size:10px; font-family:monospace;
+      cursor:pointer; border-radius:6px; transition:all 0.2s ease;
+    }
+    .scp-btn.green  { color:#00ff88; border-color:#00ff88; }
+    .scp-btn.red    { color:#ff4d4d; border-color:#ff4d4d; }
+    .scp-btn.blue   { color:#00ccff; border-color:#00ccff; }
+    .scp-btn.orange { color:#ffaa00; border-color:#ffaa00; }
+    .scp-btn:hover  { transform:scale(1.04); box-shadow:0 0 5px currentColor; }
+    #scp-console::-webkit-scrollbar       { width:4px; }
+    #scp-console::-webkit-scrollbar-track { background:#050e14; }
+    #scp-console::-webkit-scrollbar-thumb { background:#2f4553; border-radius:2px; }
+  `;
+  document.head.appendChild(style);
+
+  /* ============================================================
+     10. PANEL
+  ============================================================ */
+  const panel = document.createElement('div');
+  Object.assign(panel.style, {
+    position       : 'fixed',
+    right          : '20px',
+    bottom         : '80px',
+    width          : '340px',
+    background     : 'rgba(15,33,46,0.97)',
+    backdropFilter : 'blur(12px)',
+    color          : '#fff',
+    padding        : '14px',
+    border         : '2px solid #1a2c38',
+    borderRadius   : '16px',
+    fontFamily     : 'monospace',
+    fontSize       : '12px',
+    zIndex         : '999999',
+    lineHeight     : '1.6',
+    cursor         : 'move',
+    boxShadow      : '0 8px 24px rgba(0,0,0,0.6)',
+  });
+
+  const savedPos = JSON.parse(localStorage.getItem('panelPos') || 'null');
+  if (savedPos) {
+    panel.style.left   = savedPos.left;
+    panel.style.top    = savedPos.top;
+    panel.style.right  = 'auto';
+    panel.style.bottom = 'auto';
+  }
+  document.body.appendChild(panel);
+
+  const tsContainer = document.createElement('div');
+  tsContainer.id    = '_turnstile_container';
+  tsContainer.style.display = 'none';
+  document.body.appendChild(tsContainer);
+
+  const toggleBtn = document.createElement('div');
+  toggleBtn.innerHTML = '📊';
+  Object.assign(toggleBtn.style, {
+    position      : 'fixed',
+    left          : '20px',
+    bottom        : '20px',
+    width         : '40px',
+    height        : '40px',
+    background    : '#0f212e',
+    color         : '#00ff88',
+    display       : 'flex',
+    alignItems    : 'center',
+    justifyContent: 'center',
+    border        : '2px solid #00ff88',
+    borderRadius  : '50%',
+    cursor        : 'pointer',
+    zIndex        : '999999',
+    fontSize      : '18px',
+    boxShadow     : '0 0 8px #00ff88',
+  });
+  document.body.appendChild(toggleBtn);
+
+  let panelVisible = true;
+  toggleBtn.onclick = () => {
+    panelVisible = !panelVisible;
+    panel.style.display = panelVisible ? 'block' : 'none';
+  };
+
+  const CURRENCIES = ['usdt','btc','eth','ltc','sol','doge','xrp','trx','bnb','usdc'];
+  let activeTab = 'stats';
+
+  function updatePanel() {
+    checkReset();
+    const successRate = totalClaims ? Math.round((successClaims / totalClaims) * 100) : 0;
+    const hours       = (Date.now() - startTime) / 3600000;
+    const profitHour  = hours > 0 ? (lifetimeUsd / hours).toFixed(2) : '0.00';
+
+    const tokenBadge = authToken
+      ? '<span style="color:#00ff88;">● Token OK</span>'
+      : '<span style="color:#ff4d4d;">● Waiting for token...</span>';
+    const tsBadge = turnstileManager.cache.length > 0
+      ? '<span style="color:#00ff88;">● Turnstile ready (' + turnstileManager.cache.length + ')</span>'
+      : '<span style="color:#ffaa00;">● Turnstile warming up...</span>';
+    const claimBadge = isClaiming
+      ? '<span style="color:#ffaa00;">● Claiming...</span>'
+      : '<span style="color:#5a7a8a;">● Idle</span>';
+
+    panel.innerHTML = `
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px;">
+        <div style="font-size:13px;font-weight:bold;color:#00ff88;">⚡ Stake Monitor + Claimer PRO</div>
+        <span id="scp-hb" style="color:#00ff88;font-size:14px;">●</span>
+      </div>
+
+      <div style="background:#071018;border-radius:8px;padding:7px 9px;margin-bottom:10px;font-size:10px;line-height:2;">
+        ${tokenBadge}<br>${tsBadge}<br>${claimBadge}
+        &nbsp;&nbsp;<span style="color:#5a7a8a;">Currency: <b style="color:#00ccff;">${claimCurrency.toUpperCase()}</b></span>
+      </div>
+
+      <div style="display:flex;gap:4px;margin-bottom:12px;">
+        <button id="scp-tab-stats"   class="scp-btn ${activeTab==='stats'   ?'green':'blue'}" style="flex:1;justify-content:center;">📊 Stats</button>
+        <button id="scp-tab-console" class="scp-btn ${activeTab==='console' ?'green':'blue'}" style="flex:1;justify-content:center;">🖥️ Console</button>
+        <button id="scp-tab-config"  class="scp-btn ${activeTab==='config'  ?'green':'blue'}" style="flex:1;justify-content:center;">⚙️ Config</button>
+      </div>
+
+      <!-- STATS TAB -->
+      <div id="scp-view-stats" style="display:${activeTab==='stats'?'block':'none'};">
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:5px;margin-bottom:8px;">
+          <div style="background:#071018;border-radius:8px;padding:7px 10px;">
+            <div style="color:#3a5a6a;font-size:9px;text-transform:uppercase;">Total</div>
+            <div style="font-size:18px;font-weight:bold;">${totalClaims}</div>
+          </div>
+          <div style="background:#071018;border-radius:8px;padding:7px 10px;">
+            <div style="color:#3a5a6a;font-size:9px;text-transform:uppercase;">Success Rate</div>
+            <div style="font-size:18px;font-weight:bold;color:${successRate>=50?'#00ff88':'#ff4d4d'};">${successRate}%</div>
+          </div>
+          <div style="background:#071018;border-radius:8px;padding:7px 10px;">
+            <div style="color:#3a5a6a;font-size:9px;text-transform:uppercase;">Success</div>
+            <div style="font-size:18px;font-weight:bold;color:#00ff88;">${successClaims}</div>
+          </div>
+          <div style="background:#071018;border-radius:8px;padding:7px 10px;">
+            <div style="color:#3a5a6a;font-size:9px;text-transform:uppercase;">Failed</div>
+            <div style="font-size:18px;font-weight:bold;color:#ff4d4d;">${failedClaims}</div>
+          </div>
+        </div>
+        <div style="background:#071018;border-radius:8px;padding:8px 10px;margin-bottom:8px;font-size:11px;">
+          <div style="display:flex;justify-content:space-between;padding:2px 0;"><span style="color:#3a5a6a;">Session</span><span>$${sessionUsd.toFixed(2)}</span></div>
+          <div style="display:flex;justify-content:space-between;padding:2px 0;"><span style="color:#3a5a6a;">Daily</span><span>$${dailyUsd.toFixed(2)}</span></div>
+          <div style="display:flex;justify-content:space-between;padding:2px 0;"><span style="color:#3a5a6a;">Weekly</span><span>$${weeklyUsd.toFixed(2)}</span></div>
+          <div style="display:flex;justify-content:space-between;padding:4px 0 2px;border-top:1px solid #1a2c38;margin-top:3px;">
+            <span style="color:#00ff88;font-weight:bold;">Lifetime</span>
+            <span style="color:#00ff88;font-weight:bold;">$${lifetimeUsd.toFixed(2)}</span>
+          </div>
+          <div style="display:flex;justify-content:space-between;padding:2px 0;"><span style="color:#3a5a6a;">Profit / hr</span><span style="color:#ffaa00;">$${profitHour}</span></div>
+        </div>
+        <canvas id="scp-graph" width="308" height="65" style="border-radius:6px;display:block;margin-bottom:8px;"></canvas>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:4px;">
+          <button id="scp-resetSession" class="scp-btn green" style="justify-content:center;">🧹 Session</button>
+          <button id="scp-resetDaily"   class="scp-btn green" style="justify-content:center;">📅 Daily</button>
+          <button id="scp-resetWeekly"  class="scp-btn green" style="justify-content:center;">📆 Weekly</button>
+          <button id="scp-resetLife"    class="scp-btn red"   style="justify-content:center;">💀 Lifetime</button>
+          <button id="scp-toggleNotif"  class="scp-btn ${notifEnabled?'green':'red'}" style="justify-content:center;grid-column:span 2;">${notifEnabled?'🔔 Notif ON':'🔕 Notif OFF'}</button>
+        </div>
+      </div>
+
+      <!-- CONSOLE TAB -->
+      <div id="scp-view-console" style="display:${activeTab==='console'?'block':'none'};">
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px;">
+          <span style="color:#3a5a6a;font-size:10px;letter-spacing:1px;">LIVE LOG</span>
+          <button id="scp-clearLog" class="scp-btn blue" style="padding:2px 10px;font-size:9px;">✕ Clear</button>
+        </div>
+        <div id="scp-console" style="
+          background:#050e14;
+          border:1px solid #1a2c38;
+          border-radius:8px;
+          padding:8px 10px;
+          height:290px;
+          overflow-y:auto;
+          font-size:10px;
+          line-height:1.7;
+          word-break:break-all;
+        "></div>
+      </div>
+
+      <!-- CONFIG TAB -->
+      <div id="scp-view-config" style="display:${activeTab==='config'?'block':'none'};">
+        <div style="background:#071018;border-radius:8px;padding:8px 10px;margin-bottom:8px;">
+          <div style="color:#3a5a6a;font-size:9px;text-transform:uppercase;margin-bottom:6px;">Claim Currency</div>
+          <select id="scp-currency" style="width:100%;background:#0f212e;color:#fff;border:1px solid #2f4553;border-radius:6px;padding:5px 8px;font-size:11px;font-family:monospace;">
+            ${CURRENCIES.map(c => `<option value="${c}"${c===claimCurrency?' selected':''}>${c.toUpperCase()}</option>`).join('')}
+          </select>
+        </div>
+        <div style="background:#071018;border-radius:8px;padding:8px 10px;margin-bottom:8px;font-size:10px;">
+          <div style="color:#3a5a6a;font-size:9px;text-transform:uppercase;margin-bottom:6px;">Debug Commands</div>
+          <div style="color:#00ccff;line-height:2;">window.stakePanel.testDrop("CODE")</div>
+          <div style="color:#00ccff;line-height:2;">window.stakePanel.simulateSuccess(1.5)</div>
+          <div style="color:#00ccff;line-height:2;">window.stakePanel.simulateFail()</div>
+        </div>
+        <div style="background:#071018;border-radius:8px;padding:8px 10px;font-size:10px;">
+          <div style="color:#3a5a6a;font-size:9px;text-transform:uppercase;margin-bottom:6px;">Status</div>
+          <div style="display:flex;justify-content:space-between;padding:2px 0;"><span style="color:#3a5a6a;">Auth Token</span><span style="color:${authToken?'#00ff88':'#ff4d4d'};">${authToken?authToken.slice(0,14)+'…':'not captured'}</span></div>
+          <div style="display:flex;justify-content:space-between;padding:2px 0;"><span style="color:#3a5a6a;">Turnstile cache</span><span>${turnstileManager.cache.length}/${turnstileManager.maxCache}</span></div>
+          <div style="display:flex;justify-content:space-between;padding:2px 0;"><span style="color:#3a5a6a;">Codes seen</span><span>${claimedSet.size}</span></div>
+        </div>
+      </div>
+
+      `;
+
+    drawGraph();
+    flushConsole();
+
+    // Tab clicks
+    document.getElementById('scp-tab-stats')  ?.addEventListener('click', () => { activeTab = 'stats';   updatePanel(); });
+    document.getElementById('scp-tab-console')?.addEventListener('click', () => { activeTab = 'console'; updatePanel(); });
+    document.getElementById('scp-tab-config') ?.addEventListener('click', () => { activeTab = 'config';  updatePanel(); });
+
+    // Stats buttons
+    document.getElementById('scp-resetSession')?.addEventListener('click', () => { sessionUsd = 0; updatePanel(); });
+    document.getElementById('scp-resetLife')   ?.addEventListener('click', () => { lifetimeUsd = 0; saveStats(); updatePanel(); });
+    document.getElementById('scp-resetDaily')  ?.addEventListener('click', () => { dailyUsd = 0; savedDay = new Date().getDate(); saveStats(); updatePanel(); });
+    document.getElementById('scp-resetWeekly') ?.addEventListener('click', () => { weeklyUsd = 0; savedWeek = Date.now(); saveStats(); updatePanel(); });
+    document.getElementById('scp-toggleNotif') ?.addEventListener('click', () => { notifEnabled = !notifEnabled; localStorage.setItem('notifEnabled', JSON.stringify(notifEnabled)); updatePanel(); });
+    document.getElementById('scp-clearLog')    ?.addEventListener('click', () => { consoleLogs = []; flushConsole(); });
+
+    document.getElementById('scp-currency')?.addEventListener('change', (e) => {
+      claimCurrency = e.target.value;
+      localStorage.setItem('claimer_currency', claimCurrency);
+      log('💱 Currency changed to ' + claimCurrency.toUpperCase(), 'system');
+      updatePanel();
+    });
+  }
+
+  updatePanel();
+
+  /* ============================================================
+     11. GRAPH
+  ============================================================ */
+  function drawGraph() {
+    const c = document.getElementById('scp-graph');
+    if (!c || graphData.length < 2) return;
+    const ctx = c.getContext('2d');
+    ctx.clearRect(0, 0, c.width, c.height);
+    const max = Math.max(...graphData), min = Math.min(...graphData);
+    const range = max - min || 1;
+    const pL = 36, pB = 14, pT = 6;
+    const w = c.width - pL, h = c.height - pB - pT;
+
+    ctx.strokeStyle = '#1a2c38'; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(pL, pT); ctx.lineTo(pL, pT + h); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(pL, pT + h); ctx.lineTo(c.width, pT + h); ctx.stroke();
+    ctx.fillStyle = '#3a5a6a'; ctx.font = '8px monospace'; ctx.textAlign = 'right';
+    ctx.fillText('$' + max.toFixed(1), pL - 2, pT + 7);
+    ctx.fillText('$' + min.toFixed(1), pL - 2, pT + h);
+
+    const grad = ctx.createLinearGradient(0, pT, 0, pT + h);
+    grad.addColorStop(0, 'rgba(0,255,136,0.2)');
+    grad.addColorStop(1, 'rgba(0,255,136,0)');
+    ctx.beginPath();
+    graphData.forEach((v, i) => {
+      const x = pL + i * (w / (graphData.length - 1));
+      const y = pT + h - ((v - min) / range) * h;
+      i ? ctx.lineTo(x, y) : ctx.moveTo(x, y);
+    });
+    ctx.lineTo(pL + w, pT + h); ctx.lineTo(pL, pT + h);
+    ctx.closePath(); ctx.fillStyle = grad; ctx.fill();
+
+    ctx.beginPath(); ctx.lineWidth = 1.5; ctx.strokeStyle = '#00ff88';
+    graphData.forEach((v, i) => {
+      const x = pL + i * (w / (graphData.length - 1));
+      const y = pT + h - ((v - min) / range) * h;
+      i ? ctx.lineTo(x, y) : ctx.moveTo(x, y);
+    });
+    ctx.stroke();
+  }
+
+  /* ============================================================
+     12. DRAG
+  ============================================================ */
+  let isDragging = false, offsetX = 0, offsetY = 0;
+  panel.addEventListener('mousedown', (e) => {
+    if (['BUTTON','SELECT','CANVAS','INPUT'].includes(e.target.tagName)) return;
+    isDragging = true;
+    const rect = panel.getBoundingClientRect();
+    offsetX = e.clientX - rect.left;
+    offsetY = e.clientY - rect.top;
+  });
+  document.addEventListener('mousemove', (e) => {
+    if (!isDragging) return;
+    panel.style.left = (e.clientX - offsetX) + 'px';
+    panel.style.top  = (e.clientY - offsetY) + 'px';
+    panel.style.right = 'auto'; panel.style.bottom = 'auto';
+  });
+  document.addEventListener('mouseup', () => {
+    if (isDragging) localStorage.setItem('panelPos', JSON.stringify({ left: panel.style.left, top: panel.style.top }));
+    isDragging = false;
+  });
+
+  /* ============================================================
+     13. HEARTBEAT
+  ============================================================ */
+  setInterval(() => {
+    heartbeat = !heartbeat;
+    const el = document.getElementById('scp-hb');
+    if (el) el.style.opacity = heartbeat ? '1' : '0.2';
+  }, 1000);
+
+  /* ============================================================
+     14. TELEGRAM COMMANDS
+  ============================================================ */
+  let lastUpdateId = 0;
+  (async () => {
+    try {
+      const res  = await _origFetch('https://api.telegram.org/bot' + TELEGRAM_TOKEN + '/getUpdates?offset=-1');
+      const data = await res.json();
+      if (data.result?.length > 0) lastUpdateId = data.result[data.result.length - 1].update_id;
+    } catch (_) {}
+  })();
+
+  setInterval(async () => {
+    try {
+      const res  = await _origFetch('https://api.telegram.org/bot' + TELEGRAM_TOKEN + '/getUpdates?offset=' + (lastUpdateId + 1));
+      const data = await res.json();
+      if (!data.result?.length) return;
+      data.result.forEach(update => {
+        lastUpdateId = update.update_id;
+        const msg = update?.message?.text;
+        if (msg === '/refresh') { sendPush('🔄 Refreshed', 'Page reloaded!'); setTimeout(() => location.reload(), 2000); }
+        if (msg === '/stats') {
+          const rate = totalClaims ? Math.round((successClaims / totalClaims) * 100) : 0;
+          const hrs  = (Date.now() - startTime) / 3600000;
+          sendPush('📊 Live Stats', [
+            '✅ Success: '    + successClaims,
+            '❌ Failed: '     + failedClaims,
+            '📈 Rate: '       + rate + '%',
+            '💰 Session: $'   + sessionUsd.toFixed(2),
+            '📅 Daily: $'     + dailyUsd.toFixed(2),
+            '📆 Weekly: $'    + weeklyUsd.toFixed(2),
+            '🏆 Lifetime: $'  + lifetimeUsd.toFixed(2),
+            '⚡ Profit/hr: $' + (hrs > 0 ? (lifetimeUsd / hrs).toFixed(2) : '0.00'),
+          ].join('\n'));
+        }
+      });
+    } catch (_) {}
+  }, 10000);
+
+  /* ============================================================
+     15. INIT
+  ============================================================ */
+  async function init() {
+    log('🚀 Stake Monitor + Claimer PRO v2.0 starting...', 'system');
+    log('⏳ Initializing Turnstile...', 'system');
+    await turnstileManager.init();
+    // Intercepte XHR en plus de fetch
+const _origXHRSetHeader = XMLHttpRequest.prototype.setRequestHeader;
+XMLHttpRequest.prototype.setRequestHeader = function(name, value) {
+  if ((name.toLowerCase() === 'x-access-token' || name.toLowerCase() === 'authorization') && !authToken) {
+    authToken = value.replace(/^Bearer\s+/i, '');
+    log('🔑 Auth token captured via XHR', 'system');
+    updatePanel();
+  }
+  return _origXHRSetHeader.apply(this, arguments);
+};
+    log('⏳ Waiting for auth token', 'warn');
+
+    window.stakePanel = unsafeWindow.stakePanel = {
+      cache           : () => turnstileManager.cache,
+      testDrop        : (code) => { log('🧪 Manual test drop: ' + code, 'warn'); processClaim(code.toUpperCase()); },
+      simulateSuccess : (v = 1.00) => handleClaim('TEST', v, true, '', claimCurrency),
+      simulateFail    : ()         => handleClaim('TEST', 0, false, 'test', claimCurrency),
+      resetDaily      : () => { dailyUsd = 0; savedDay = new Date().getDate(); saveStats(); updatePanel(); },
+      resetWeekly     : () => { weeklyUsd = 0; savedWeek = Date.now(); saveStats(); updatePanel(); },
+    };
+
+    log('✅ Claimer ready!', 'success');
+    updatePanel();
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', init);
+  } else {
+    init();
+  }
+
+})();
